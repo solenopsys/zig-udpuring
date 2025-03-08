@@ -7,24 +7,26 @@ const net = std.net;
 const Allocator = std.mem.Allocator;
 
 const BUFFER_SIZE = 8192;
-const MAX_CLIENTS = 64; // Максимальное количество одновременных клиентов
+const CONCURRENT_OPERATIONS = 64; // Количество одновременных операций чтения
 
-const ClientData = struct {
-    addr: posix.sockaddr,
-    addr_len: posix.socklen_t,
+// Структура для буфера и метаданных операции
+const RecvOperation = struct {
     buffer: []u8,
-    used: bool,
+    addr: posix.sockaddr, // Используем обычный sockaddr
+    addr_len: posix.socklen_t,
+    msghdr: posix.msghdr,
+    iov: [1]posix.iovec,
 };
 
 // Тип для функции обработчика сообщений
-pub const MessageHandlerFn = *const fn (data: []const u8, client_index: usize, client_addr: *const posix.sockaddr, client_addr_len: posix.socklen_t, userdata: ?*anyopaque) void;
+pub const MessageHandlerFn = *const fn (data: []const u8, client_addr: *const posix.sockaddr, client_addr_len: posix.socklen_t, userdata: ?*anyopaque) void;
 
 // Структура UDP сервера
 pub const UdpIoUringServer = struct {
     allocator: Allocator,
     socket: posix.fd_t,
     ring: linux.IoUring,
-    clients: []ClientData,
+    recv_ops: []RecvOperation,
     base_user_data: u64,
     message_handler: MessageHandlerFn,
     userdata: ?*anyopaque,
@@ -45,18 +47,31 @@ pub const UdpIoUringServer = struct {
         var ring = try linux.IoUring.init_params(ring_size, &ring_params);
         errdefer ring.deinit();
 
-        // Создаем пул буферов и клиентских данных
-        const clients = try allocator.alloc(ClientData, MAX_CLIENTS);
-        errdefer {
-            allocator.free(clients);
-        }
+        // Создаем пул операций чтения
+        const recv_ops = try allocator.alloc(RecvOperation, CONCURRENT_OPERATIONS);
+        errdefer allocator.free(recv_ops);
 
-        // Инициализируем структуры клиентов
-        for (clients) |*client| {
-            client.buffer = try allocator.alloc(u8, BUFFER_SIZE);
-            client.addr_len = @sizeOf(posix.sockaddr);
-            client.addr = std.mem.zeroes(posix.sockaddr);
-            client.used = false;
+        // Инициализируем структуры операций
+        for (recv_ops) |*op| {
+            op.buffer = try allocator.alloc(u8, BUFFER_SIZE);
+            op.addr_len = @sizeOf(posix.sockaddr);
+            op.addr = std.mem.zeroes(posix.sockaddr);
+
+            // Предварительно настраиваем структуры msghdr и iovec
+            op.iov[0] = posix.iovec{
+                .base = op.buffer.ptr,
+                .len = op.buffer.len,
+            };
+
+            op.msghdr = posix.msghdr{
+                .name = @ptrCast(&op.addr),
+                .namelen = op.addr_len,
+                .iov = &op.iov,
+                .iovlen = 1,
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            };
         }
 
         const base_user_data: u64 = 1000;
@@ -66,16 +81,16 @@ pub const UdpIoUringServer = struct {
             .allocator = allocator,
             .socket = socket,
             .ring = ring,
-            .clients = clients,
+            .recv_ops = recv_ops,
             .base_user_data = base_user_data,
             .message_handler = message_handler,
             .userdata = userdata,
         };
 
         // Подготавливаем начальные операции чтения
-        for (0..MAX_CLIENTS) |i| {
+        for (0..CONCURRENT_OPERATIONS) |i| {
             const recv_user_data = base_user_data + i;
-            try server.recvRequestWithMsgName(i, recv_user_data);
+            try server.recvRequest(i, recv_user_data);
         }
 
         return server;
@@ -83,47 +98,34 @@ pub const UdpIoUringServer = struct {
 
     // Освобождение ресурсов
     pub fn deinit(self: *UdpIoUringServer) void {
-        for (self.clients) |*client| {
-            if (client.used) {
-                self.allocator.free(client.buffer);
-            }
+        for (self.recv_ops) |*op| {
+            self.allocator.free(op.buffer);
         }
 
-        self.allocator.free(self.clients);
+        self.allocator.free(self.recv_ops);
         self.ring.deinit();
         posix.close(self.socket);
     }
 
-    // Метод для отправки данных клиенту
-    pub fn send(self: *UdpIoUringServer, data: []const u8, client_index: usize, user_data: u64) !void {
-        if (client_index >= MAX_CLIENTS) {
-            return error.InvalidClientIndex;
-        }
-
-        const client = &self.clients[client_index];
-        try self.sendInternal(data, &client.addr, client.addr_len, user_data);
-    }
-
     // Отправка данных по адресу
     pub fn sendToAddr(self: *UdpIoUringServer, data: []const u8, addr: *const posix.sockaddr, addr_len: posix.socklen_t, user_data: u64) !void {
-        try self.sendInternal(data, addr, addr_len, user_data);
-    }
-
-    // Внутренний метод для отправки данных
-    fn sendInternal(self: *UdpIoUringServer, data: []const u8, addr: *const posix.sockaddr, addr_len: posix.socklen_t, user_data: u64) !void {
         const sqe = try self.ring.get_sqe();
 
-        // Настраиваем операцию SENDMSG для ответа
-        var msghdr = std.mem.zeroes(posix.msghdr);
         var iov = [_]posix.iovec{.{
             .base = @as([*]u8, @ptrCast(@constCast(data.ptr))),
             .len = data.len,
         }};
 
-        msghdr.name = @constCast(addr);
-        msghdr.namelen = addr_len;
-        msghdr.iov = &iov;
-        msghdr.iovlen = 1;
+        // Создаем стабильный msghdr для отправки
+        var msghdr = posix.msghdr{
+            .name = @ptrCast(@constCast(addr)),
+            .namelen = addr_len,
+            .iov = &iov,
+            .iovlen = 1,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
 
         // Настраиваем операцию SENDMSG
         sqe.* = .{
@@ -145,28 +147,24 @@ pub const UdpIoUringServer = struct {
     }
 
     // Подготовка операции получения данных
-    fn recvRequestWithMsgName(self: *UdpIoUringServer, client_index: usize, user_data: u64) !void {
+    fn recvRequest(self: *UdpIoUringServer, op_index: usize, user_data: u64) !void {
         const sqe = try self.ring.get_sqe();
-        const client = &self.clients[client_index];
+        const op = &self.recv_ops[op_index];
 
-        // Используем RECVMSG для получения адреса отправителя
-        var msghdr = std.mem.zeroes(posix.msghdr);
-        var iov = [_]posix.iovec{.{
-            .base = client.buffer.ptr,
-            .len = client.buffer.len,
-        }};
+        // Обновляем указатель на буфер в iovec (на случай, если он был изменен)
+        op.iov[0].base = op.buffer.ptr;
+        op.iov[0].len = op.buffer.len;
 
-        msghdr.name = &client.addr;
-        msghdr.namelen = client.addr_len;
-        msghdr.iov = &iov;
-        msghdr.iovlen = 1;
+        // Обновляем указатель на структуру адреса
+        op.msghdr.name = @ptrCast(&op.addr);
+        op.msghdr.namelen = op.addr_len;
 
-        // Настраиваем операцию RECVMSG
+        // Настраиваем операцию RECVMSG с уже подготовленной структурой msghdr
         sqe.* = .{
             .opcode = .RECVMSG,
             .fd = self.socket,
             .off = 0,
-            .addr = @intFromPtr(&msghdr),
+            .addr = @intFromPtr(&op.msghdr),
             .len = 1, // количество векторов (всегда 1 для msghdr)
             .rw_flags = 0,
             .flags = 0,
@@ -188,12 +186,6 @@ pub const UdpIoUringServer = struct {
                 continue;
             };
             _ = submitted;
-
-            // Неблокирующее ожидание событий с тайм-аутом
-            _ = linux.kernel_timespec{
-                .tv_sec = 0,
-                .tv_nsec = 100, // 100 ns
-            };
 
             // Используем ручной вызов io_uring_enter с GETEVENTS
             const cqes_ready = self.ring.cq_ready();
@@ -218,36 +210,36 @@ pub const UdpIoUringServer = struct {
                 continue;
             };
 
-            // Определяем индекс клиента по user_data
-            const client_index = cqe.user_data - self.base_user_data;
-            if (client_index >= MAX_CLIENTS) {
-                log("Некорректный индекс клиента: {d}\n", .{client_index});
+            // Определяем индекс операции по user_data
+            const op_index = cqe.user_data - self.base_user_data;
+            if (op_index >= CONCURRENT_OPERATIONS) {
+                log("Некорректный индекс операции: {d}\n", .{op_index});
                 continue;
             }
 
-            var client = &self.clients[@intCast(client_index)];
+            var op = &self.recv_ops[@intCast(op_index)];
 
             // Проверяем результат операции
             if (cqe.res < 0) {
                 log("Ошибка операции: {d}\n", .{cqe.res});
-                // Подготавливаем новую операцию чтения для этого клиента
-                try self.recvRequestWithMsgName(@intCast(client_index), self.base_user_data + client_index);
+                // Несмотря на ошибку, подготовим новую операцию чтения
             } else if (cqe.res > 0) {
                 const bytes_read = @as(usize, @intCast(cqe.res));
 
-                log("Получено {d} байт от клиента {d}\n", .{ bytes_read, client_index });
+                //   log("Получено {d} байт\n", .{bytes_read});
 
-                // Вызываем обработчик сообщений
-                self.message_handler(client.buffer[0..bytes_read], client_index, &client.addr, client.addr_len, self.userdata);
+                // Приведение типа с указанием целевого типа
+                const addr = @as(*const posix.sockaddr, &op.addr);
 
-                // Подготавливаем новую операцию чтения для этого клиента
-                try self.recvRequestWithMsgName(@intCast(client_index), self.base_user_data + client_index);
+                // Вызываем обработчик сообщений с адресом отправителя
+                self.message_handler(op.buffer[0..bytes_read], addr, op.addr_len, self.userdata);
             } else {
                 // res == 0, что необычно для UDP, но на всякий случай обрабатываем
                 log("Получен пакет нулевой длины\n", .{});
-                // Подготавливаем новую операцию чтения для этого клиента
-                try self.recvRequestWithMsgName(@intCast(client_index), self.base_user_data + client_index);
             }
+
+            // После обработки подготавливаем новую операцию чтения
+            try self.recvRequest(@intCast(op_index), self.base_user_data + op_index);
         }
     }
 };
@@ -257,22 +249,22 @@ fn createUdpSocket(port: u16) !posix.fd_t {
     const socket = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
     errdefer posix.close(socket);
 
+    // Установка опций сокета
     const yes: i32 = 1;
     try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, mem.asBytes(&yes));
     try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEPORT, mem.asBytes(&yes));
+
+    // Увеличиваем размеры буферов сокета для лучшей производительности при высоких нагрузках
+    const buffer_size: i32 = 16 * 1024 * 1024; // 16 MB
+    _ = posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVBUF, mem.asBytes(&buffer_size)) catch |err| {
+        log("Предупреждение: не удалось установить SO_RCVBUF: {any}\n", .{err});
+    };
+    _ = posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDBUF, mem.asBytes(&buffer_size)) catch |err| {
+        log("Предупреждение: не удалось установить SO_SNDBUF: {any}\n", .{err});
+    };
 
     const address = net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
     try posix.bind(socket, &address.any, address.getOsSockLen());
 
     return socket;
-}
-
-// Пример функции обработчика сообщений
-fn handleMessage(data: []const u8, client_index: usize, client_addr: *const posix.sockaddr, client_addr_len: posix.socklen_t, userdata: ?*anyopaque) void {
-    _ = userdata;
-    _ = client_addr_len;
-    _ = client_addr;
-    log("Обработка сообщения: {s} от клиента {d}\n", .{ data, client_index });
-    // Здесь обрабатываем сообщение
-    // НЕ отправляем автоматический ответ
 }
