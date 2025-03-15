@@ -1,7 +1,7 @@
 .{
     .name = .udp_uring,
 
-    .version = "0.0.0",
+    .version = "0.0.1",
 
     .fingerprint = 0x868613a9b609f665,
 
