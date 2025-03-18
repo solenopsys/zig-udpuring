@@ -18,3 +18,10 @@ Performance: 1328991 req/s, 1837.77 MB/s
 zig run -O ReleaseFast src/rps.zig 
 
 sudo bash ./bn.sh
+
+
+
+echo "Hello, World!" | nc -u 192.168.1.1 8888
+
+# TODO
+Нужно оптимизировать udp.zig так как old/udp.zig  обрабатывать 1.35 миллионва сообщений в секунду а просто udp.zig 0.9 миллионва сообщений в секунду

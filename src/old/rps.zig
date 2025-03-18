@@ -1,11 +1,10 @@
 const std = @import("std");
-const net = std.net;
-const mem = std.mem;
-const xev = @import("xev");
-const Thread = std.Thread;
+const posix = std.posix;
 const log = std.debug.print;
-const udp = @import("udp.zig");
-const UdpGate = udp.UdpGate;
+const Thread = std.Thread;
+
+const server_module = @import("udp.zig");
+const UdpIoUringServer = server_module.UdpIoUringServer;
 
 // Структура для хранения статистики
 const StatsResult = struct { count: u64, bytes: u64 };
@@ -60,6 +59,16 @@ const PerformanceTracker = struct {
 var perf_tracker = PerformanceTracker.init();
 var server_running = true;
 
+// Функция обработчика сообщений с подсчетом
+fn benchmarkMessageHandler(data: []const u8, client_addr: *const posix.sockaddr, client_addr_len: posix.socklen_t, userdata: ?*anyopaque) void {
+    _ = client_addr;
+    _ = client_addr_len;
+    _ = userdata;
+
+    // Просто инкрементируем счетчики
+    perf_tracker.increment(data.len);
+}
+
 // Функция для отчета о производительности
 fn reporterThread() void {
     // Чтобы не измерять время точно, просто ждем примерно 1 секунду между отчетами
@@ -75,43 +84,27 @@ fn reporterThread() void {
     }
 }
 
-// Функция обработчика сообщений с подсчетом
-fn benchmarkMessageHandler(self: *UdpGate, data: []const u8, client_addr: net.Address) void {
-    _ = self;
-    _ = client_addr;
-
-    // Просто инкрементируем счетчики
-    perf_tracker.increment(data.len);
-}
-
 pub fn main() !void {
-    // Инициализация аллокатора
+    // Инициализация UDP сервера
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = general_purpose_allocator.deinit();
     const gpa = general_purpose_allocator.allocator();
 
-    const port: u16 = 8888;
-
-    log("Starting UDP benchmark server on port {d}...\n", .{port});
+    log("Starting UDP benchmark server on port 8888...\n", .{});
     log("Press Ctrl+C to exit\n", .{});
 
     // Запускаем поток для отчетов
     var reporter = try Thread.spawn(.{}, reporterThread, .{});
 
     // Инициализация UDP сервера
-    const server_addr = try net.Address.parseIp4("0.0.0.0", port);
-    var gate = try UdpGate.init(gpa, server_addr);
+    var server = try UdpIoUringServer.init(gpa, 8888, &benchmarkMessageHandler, null);
     defer {
         server_running = false;
-        gate.deinit();
+        server.deinit();
     }
 
-    // Установка обработчика сообщений
-    gate.setMessageHandler(benchmarkMessageHandler);
+    try server.run();
 
-    // Запуск сервера
-    try gate.listen();
-
-    // Этот код не должен выполниться, так как gate.listen() никогда не вернется
+    // Этот код не должен выполниться, так как server.run() никогда не вернется
     reporter.join();
 }

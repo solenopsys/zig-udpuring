@@ -10,7 +10,7 @@ run_hping() {
 
 # Launch 16 threads in the background
 echo "Starting 16 hping3 threads..."
-for i in {1..8}; do
+for i in {1..6}; do
     echo "Launching thread $i"
     run_hping &
     # Store PID of the background process
