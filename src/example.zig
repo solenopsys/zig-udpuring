@@ -31,6 +31,9 @@ pub fn main() !void {
     // Initialize server address
     const server_addr = try net.Address.parseIp4("0.0.0.0", port);
 
+    // print listen port
+    std.debug.print("Listening on port {d}\n", .{port});
+
     // Create and initialize UdpGate
     var gate = try UdpGate.init(allocator, server_addr);
     defer gate.deinit();
