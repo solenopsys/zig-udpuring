@@ -6,6 +6,7 @@ const Thread = std.Thread;
 const log = std.debug.print;
 const udp = @import("udp.zig");
 const UdpGate = udp.UdpGate;
+const MessageHandler = udp.MessageHandler;
 
 // Структура для хранения статистики
 const StatsResult = struct { count: u64, bytes: u64 };
@@ -76,7 +77,7 @@ fn reporterThread() void {
 }
 
 // Функция обработчика сообщений с подсчетом
-fn benchmarkMessageHandler(self: *UdpGate, data: []const u8, client_addr: net.Address) void {
+fn benchmarkMessageHandler(self: *anyopaque, data: []const u8, client_addr: net.Address) void {
     _ = self;
     _ = client_addr;
 
@@ -107,7 +108,10 @@ pub fn main() !void {
     }
 
     // Установка обработчика сообщений
-    gate.setMessageHandler(benchmarkMessageHandler);
+    gate.setMessageHandler(MessageHandler{
+        .gate = gate,
+        .onMessage = benchmarkMessageHandler,
+    });
 
     // Запуск сервера
     try gate.listen();

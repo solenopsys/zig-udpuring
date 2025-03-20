@@ -4,11 +4,12 @@ const mem = std.mem;
 const xev = @import("xev");
 const udp = @import("udp.zig");
 const UdpGate = udp.UdpGate;
+const MessageHandler = udp.MessageHandler;
 
 const DEFAULT_PORT = 8080;
 
 // Example message handler that sends echo responses
-fn echoHandler(self: *UdpGate, data: []const u8, sender: net.Address) void {
+fn echoHandler(self: *anyopaque, data: []const u8, sender: net.Address) void {
     std.debug.print("Эхо-обработчик получил: {s}\n", .{data});
     self.send(sender, data);
 }
@@ -39,7 +40,10 @@ pub fn main() !void {
     defer gate.deinit();
 
     // Set echo handler
-    gate.setMessageHandler(echoHandler);
+    gate.setMessageHandler(MessageHandler{
+        .gate = gate,
+        .onMessage = echoHandler,
+    });
 
     // Start listening for messages
     try gate.listen();

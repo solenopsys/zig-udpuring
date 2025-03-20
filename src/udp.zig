@@ -5,6 +5,11 @@ const xev = @import("xev");
 
 const BUFFER_SIZE = 8192;
 
+pub const MessageHandler = struct {
+    gate: *UdpGate,
+    onMessage: *const fn (ctx: *anyopaque, data: []const u8, sender: net.Address) void,
+};
+
 /// UdpGate provides a simple interface for UDP communication
 pub const UdpGate = struct {
     allocator: mem.Allocator,
@@ -16,10 +21,7 @@ pub const UdpGate = struct {
     recv_completion: xev.Completion = undefined,
     send_completion: xev.Completion = undefined,
     address: net.Address,
-    message_handler: ?MessageHandlerFn = null,
-
-    /// Function type for message handlers
-    pub const MessageHandlerFn = *const fn (self: *UdpGate, data: []const u8, sender: net.Address) void;
+    message_handler: ?MessageHandler = null,
 
     /// Initialize a new UdpGate
     pub fn init(allocator: mem.Allocator, address: net.Address) !*UdpGate {
@@ -51,7 +53,7 @@ pub const UdpGate = struct {
     }
 
     /// Set a handler for incoming messages
-    pub fn setMessageHandler(self: *UdpGate, handler: MessageHandlerFn) void {
+    pub fn setMessageHandler(self: *UdpGate, handler: MessageHandler) void {
         self.message_handler = handler;
     }
 
@@ -154,7 +156,7 @@ fn onReceive(
     // Process received data
     if (gate) |g| {
         if (g.message_handler) |handler| {
-            handler(g, data, addr);
+            handler.onMessage(g, data, addr);
         } else {
             // Default behavior: print received data
             std.debug.print("Получено {d} байт от {}: {s}\n", .{ bytes_read, addr, data });
